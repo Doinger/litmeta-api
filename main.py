@@ -5,7 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import xmltodict
 from datetime import datetime
-c
 APP_NAME = "LitMeta"
 VERSION = "1.0"
 
