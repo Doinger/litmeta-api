@@ -14,7 +14,8 @@ VERSION = "1.0"
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "you@example.com")  # 改成你的邮箱
 CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", "you@example.com")  # 改成你的邮箱
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12.0"))
-
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 app = FastAPI(title=APP_NAME, version=VERSION)
 
 # 允许被 ChatGPT 调用（简单起见放开 CORS）
@@ -198,8 +199,6 @@ async def crossref_by_title(title: str = Query(..., description="论文标题"))
             "authors_short": authors_short,
             "url": it.get("URL", "")
         }
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
 
 @app.post("/validate-quotes")
 def validate_quotes(payload: dict = Body(...)):
