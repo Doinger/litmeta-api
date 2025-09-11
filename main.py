@@ -45,8 +45,10 @@ MAX_PARAS_PER_CALL = 100           # 单次最多校验多少段，超出请分�
 TIMEOUT_SEC = 60
 
 def _extract_page_texts_from_bytes(pdf_bytes: bytes):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    return [(p.extract_text() or "") for p in reader.pages]
+  if not _PYPDF2_OK:
+      raise RuntimeError("PyPDF2_not_installed")
+  reader = PdfReader(io.BytesIO(pdf_bytes))
+  return [(p.extract_text() or "") for p in reader.pages]
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
@@ -57,37 +59,58 @@ def pdf_to_base64(pdf_path: str) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
     
 def make_placeholder_batch():
-    """返回符合 AcademicBatchV1_1 的极小占位 JSON。"""
-    return {
-        "batch_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
-        "papers": [
-            {
-                "paper_id": "P1",
-                "filename": "",
-                "meta": {"title": "", "year": "", "journal": "", "doi": "", "pmid": ""},
-                "sections": [
-                    {
-                        "section_title": "Introduction",
-                        "paragraphs": [
-                            {
-                                "para_index": 1,
-                                "text_preview": "占位预览（≤200字）。",
-                                "key_points": ["提出研究空白", "界定目标人群"],
-                                "evidence": [],
-                                "claims_strength": "medium",
-                                "limitations_flags": []
-                            }
-                        ]
-                    }
-                ],
-                "segmentation_audit": {
-                    "sections_detected": 1,
-                    "paragraphs_detected": 1,
-                    "paragraphs_reported": 1
-                }
-            }
-        ]
+    """
+    AcademicBatchV2_1 的最小占位：
+    - coverage_plan & segmentation_audit 字段齐全
+    - 段落含 paragraph_signature / source_quote / source_page / hallucination_flag 等必填
+    仅用于 Actions 对齐 Schema；真正内容由模型生成并覆盖。
+    """
+    batch_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    section_title = "Introduction"
+    para = {
+        "para_index": 1,
+        "paragraph_signature": "placeholder intro first sentence",
+        "source_quote": "placeholder source quote",
+        "source_page": 1,
+        "text_preview": "placeholder source quote",
+        "key_points": ["占位要点A", "占位要点B"],
+        "evidence": [],
+        "claims_strength": "medium",
+        "limitations_flags": [],
+        "dedup_status": "unique",
+        "dedup_ref": None,
+        "hallucination_flag": False
     }
+    return {
+        "batch_id": batch_id,
+        "papers": [{
+            "paper_id": "P1",
+            "filename": "",
+            "meta": {"title": "", "year": "", "journal": "", "doi": "", "pmid": ""},
+            "coverage_plan": {
+                "split_rule_used": "heuristic",
+                "total_paragraphs": 1,
+                "plan": [{"para_index": 1, "paragraph_signature": para["paragraph_signature"]}]
+            },
+            "sections": [{
+                "section_title": section_title,
+                "paragraphs": [para]
+            }],
+            "segmentation_audit": {
+                "split_rule_used": "heuristic",
+                "sections_detected": 1,
+                "paragraphs_detected": 1,
+                "paragraphs_reported": 1,
+                "missing_paragraph_indices": [],
+                "duplicates": [],
+                "key_facts_detected": [],
+                "key_facts_reported": [],
+                "quotes_reported": 1,
+                "quotes_matched": 0  # 占位；真实验证后模型会回写
+            }
+        }]
+    }
+
 
 @app.post("/validate-quotes-upload")
 async def validate_quotes_upload(
@@ -166,7 +189,7 @@ async def analyze(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "app": APP_NAME, "version": VERSION}
+    return {"ok": True, "status": "ok", "app": APP_NAME, "version": VERSION}
 
 @app.get("/pubmed/search")
 async def pubmed_search(query: str = Query(..., description="PubMed 查询语句"),
