@@ -7,6 +7,7 @@ import xmltodict
 from datetime import datetime
 from PyPDF2 import PdfReader
 import base64, io, re
+from fastapi.responses import JSONResponse
 
 APP_NAME = "LitMeta"
 VERSION = "1.0"
@@ -24,6 +25,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+try:
+    import httpx
+    _HTTPX_OK = True
+except Exception:
+    _HTTPX_OK = False
+
+try:
+    from PyPDF2 import PdfReader
+    _PYPDF2_OK = True
+except Exception:
+    _PYPDF2_OK = False
+
+MAX_B64_BYTES = 15 * 1024 * 1024   # 15MB 上限，避免 Render/网关超限
+MAX_PARAS_PER_CALL = 100           # 单次最多校验多少段，超出请分批
+TIMEOUT_SEC = 60
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
@@ -226,31 +243,103 @@ async def upload_and_validate(request: Request):
     # 调用 validate_quotes 内部逻辑
     return validate_quotes({"pdf_b64": pdf_b64, "paragraphs": paragraphs})
 
-
 @app.post("/validate-quotes")
 def validate_quotes(payload: dict = Body(...)):
     """
-    校验每段的 source_quote 是否能在指定 source_page 找到
+    校验 paragraphs[*].source_quote 是否真实出现在指定的 source_page。
+    入参优先级：page_texts > pdf_b64 > pdf_url
+    返回始终为 200，携带 status 与 errors，避免 500 影响调用链。
     """
-    pdf_b64 = payload.get("pdf_b64")
-    page_texts = payload.get("page_texts")
-    if not page_texts:
-        assert pdf_b64, "必须提供 pdf_b64 或 page_texts"
-        pdf_bytes = base64.b64decode(pdf_b64)
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        page_texts = [(p.extract_text() or "") for p in reader.pages]
+    try:
+        # -------- 参数预检 --------
+        if not isinstance(payload, dict):
+            return JSONResponse({"status": "error", "errors": ["invalid_json"]}, status_code=200)
 
-    checked, matched, mismatches = 0, 0, []
-    for item in payload.get("paragraphs", []):
-        checked += 1
-        q = norm(item.get("source_quote", ""))
-        pg = int(item.get("source_page", 1)) - 1
-        if pg < 0 or pg >= len(page_texts) or not q:
-            mismatches.append({**item, "reason": "invalid_page_or_empty_quote"})
-            continue
-        hay = norm(page_texts[pg])
-        if q and q in hay:
-            matched += 1
+        paragraphs = payload.get("paragraphs") or []
+        if not isinstance(paragraphs, list) or len(paragraphs) == 0:
+            return JSONResponse({"status": "error", "errors": ["paragraphs_required"]}, status_code=200)
+
+        if len(paragraphs) > MAX_PARAS_PER_CALL:
+            return JSONResponse({
+                "status": "error",
+                "errors": [f"too_many_paragraphs:{len(paragraphs)} > {MAX_PARAS_PER_CALL}"],
+                "advice": f"请分批调用，每次不超过 {MAX_PARAS_PER_CALL} 段"
+            }, status_code=200)
+
+        page_texts = payload.get("page_texts")
+        pdf_b64 = payload.get("pdf_b64")
+        pdf_url = payload.get("pdf_url")
+
+        # -------- 获取 page_texts --------
+        if isinstance(page_texts, list) and page_texts:
+            pass  # 已有每页文本
+        elif pdf_b64:
+            if not _PYPDF2_OK:
+                return JSONResponse({"status": "error", "errors": ["PyPDF2_not_installed"]}, status_code=200)
+            try:
+                raw = base64.b64decode(pdf_b64, validate=True)
+            except Exception as e:
+                return JSONResponse({"status": "error", "errors": [f"b64_decode_failed:{e}"]}, status_code=200)
+            if len(raw) > MAX_B64_BYTES:
+                return JSONResponse({"status": "error", "errors": ["pdf_too_large"], "limit_bytes": MAX_B64_BYTES}, status_code=200)
+            try:
+                reader = PdfReader(io.BytesIO(raw))
+                page_texts = [(p.extract_text() or "") for p in reader.pages]
+            except Exception as e:
+                return JSONResponse({"status": "error", "errors": [f"pdf_extract_failed:{e}"]}, status_code=200)
+        elif pdf_url:
+            if not _HTTPX_OK:
+                return JSONResponse({"status": "error", "errors": ["httpx_not_installed"]}, status_code=200)
+            if not str(pdf_url).lower().startswith("https://"):
+                return JSONResponse({"status": "error", "errors": ["pdf_url_must_be_https"]}, status_code=200)
+            try:
+                with httpx.Client(timeout=TIMEOUT_SEC, follow_redirects=True) as cli:
+                    r = cli.get(pdf_url)
+                if r.status_code != 200 or "pdf" not in r.headers.get("content-type","").lower():
+                    return JSONResponse({"status": "error", "errors": ["download_failed_or_not_pdf"]}, status_code=200)
+                if len(r.content) > MAX_B64_BYTES:
+                    return JSONResponse({"status": "error", "errors": ["pdf_too_large"], "limit_bytes": MAX_B64_BYTES}, status_code=200)
+                if not _PYPDF2_OK:
+                    return JSONResponse({"status": "error", "errors": ["PyPDF2_not_installed"]}, status_code=200)
+                reader = PdfReader(io.BytesIO(r.content))
+                page_texts = [(p.extract_text() or "") for p in reader.pages]
+            except Exception as e:
+                return JSONResponse({"status": "error", "errors": [f"download_or_extract_failed:{e}"]}, status_code=200)
         else:
-            mismatches.append({**item, "reason": "quote_not_found_on_page"})
-    return {"checked": checked, "matched": matched, "mismatches": mismatches}
+            return JSONResponse({"status": "error", "errors": ["pdf_b64_or_page_texts_or_pdf_url_required"]}, status_code=200)
+
+        if not page_texts or not isinstance(page_texts, list):
+            return JSONResponse({"status": "error", "errors": ["empty_page_texts"]}, status_code=200)
+
+        # -------- 逐段匹配 --------
+        checked, matched = 0, 0
+        mismatches = []
+        for item in paragraphs:
+            checked += 1
+            q = norm(item.get("source_quote"))
+            try:
+                pg = int(item.get("source_page", 1)) - 1
+            except Exception:
+                pg = -1
+
+            if pg < 0 or pg >= len(page_texts) or not q:
+                mismatches.append({**item, "reason": "invalid_page_or_empty_quote"})
+                continue
+
+            hay = norm(page_texts[pg])
+            if q and q in hay:
+                matched += 1
+            else:
+                mismatches.append({**item, "reason": "quote_not_found_on_page"})
+
+        return JSONResponse({
+            "status": "ok",
+            "checked": checked,
+            "matched": matched,
+            "mismatches": mismatches,
+            "pages": len(page_texts)
+        }, status_code=200)
+
+    except Exception as e:
+        # 兜底：永不 500，把异常变成结构化错误返回
+        return JSONResponse({"status": "error", "errors": [f"unexpected:{type(e).__name__}:{e}"]}, status_code=200)
