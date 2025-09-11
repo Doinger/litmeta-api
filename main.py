@@ -1,10 +1,11 @@
 import os
 from typing import List, Dict, Any
-from fastapi import FastAPI, Query
+from fastapi import Request, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import xmltodict
-
+from datetime import datetime
+c
 APP_NAME = "LitMeta"
 VERSION = "1.0"
 
@@ -21,6 +22,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def make_placeholder_batch():
+    """返回符合 AcademicBatchV1_1 的极小占位 JSON。"""
+    return {
+        "batch_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+        "papers": [
+            {
+                "paper_id": "P1",
+                "filename": "",
+                "meta": {"title": "", "year": "", "journal": "", "doi": "", "pmid": ""},
+                "sections": [
+                    {
+                        "section_title": "Introduction",
+                        "paragraphs": [
+                            {
+                                "para_index": 1,
+                                "text_preview": "占位预览（≤200字）。",
+                                "key_points": ["提出研究空白", "界定目标人群"],
+                                "evidence": [],
+                                "claims_strength": "medium",
+                                "limitations_flags": []
+                            }
+                        ]
+                    }
+                ],
+                "segmentation_audit": {
+                    "sections_detected": 1,
+                    "paragraphs_detected": 1,
+                    "paragraphs_reported": 1
+                }
+            }
+        ]
+    }
+
+# --- Actions 专用小端点：永远返回“很小”的占位 JSON ---
+@app.post("/action-analyze")
+async def action_analyze(_: Request):
+    return make_placeholder_batch()
+
+# （可选）如果你一定要沿用 /analyze 路径，可以加一个轻量开关：
+@app.post("/analyze")
+async def analyze(request: Request):
+    # 轻量模式：当带上 ?mode=anchor 或头 X-Action-Anchor: 1 时，返回占位
+    qp = dict(request.query_params)
+    if qp.get("mode") == "anchor" or request.headers.get("X-Action-Anchor") == "1":
+        return make_placeholder_batch()
+
+    # 否则走你原有的“重逻辑”（如已存在则调用；没有就先返回占位）
+    try:
+        body = await request.json()
+        # TODO: 这里接入你现有的 heavy analyze 逻辑
+        # result = await heavy_analyze(body)
+        # return result
+    except Exception:
+        pass
+    return make_placeholder_batch()
 
 @app.get("/health")
 async def health():
