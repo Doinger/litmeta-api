@@ -27,6 +27,11 @@ app.add_middleware(
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
+def pdf_to_base64(pdf_path: str) -> str:
+    """将 PDF 文件转为 Base64 字符串"""
+    with open(pdf_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
     
 def make_placeholder_batch():
     """返回符合 AcademicBatchV1_1 的极小占位 JSON。"""
@@ -201,6 +206,26 @@ async def crossref_by_title(title: str = Query(..., description="论文标题"))
             "authors_short": authors_short,
             "url": it.get("URL", "")
         }
+
+@app.post("/upload-and-validate")
+async def upload_and_validate(request: Request):
+    """
+    用户上传 PDF 文件 + 段落信息，自动转成 pdf_b64，再调用 validate-quotes
+    """
+    form = await request.form()
+    pdf_file = form["file"]
+    pdf_bytes = await pdf_file.read()
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+    # 获取段落数据（前端上传时应一并传）
+    paragraphs = form.get("paragraphs")
+    if isinstance(paragraphs, str):
+        import json
+        paragraphs = json.loads(paragraphs)
+
+    # 调用 validate_quotes 内部逻辑
+    return validate_quotes({"pdf_b64": pdf_b64, "paragraphs": paragraphs})
+
 
 @app.post("/validate-quotes")
 def validate_quotes(payload: dict = Body(...)):
