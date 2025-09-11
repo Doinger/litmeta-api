@@ -1,10 +1,13 @@
 import os
 from typing import List, Dict, Any
-from fastapi import Request, FastAPI, Query
+from fastapi import Request, FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import xmltodict
 from datetime import datetime
+from PyPDF2 import PdfReader
+import base64, io, re
+
 APP_NAME = "LitMeta"
 VERSION = "1.0"
 
@@ -195,3 +198,33 @@ async def crossref_by_title(title: str = Query(..., description="论文标题"))
             "authors_short": authors_short,
             "url": it.get("URL", "")
         }
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+@app.post("/validate-quotes")
+def validate_quotes(payload: dict = Body(...)):
+    """
+    校验每段的 source_quote 是否能在指定 source_page 找到
+    """
+    pdf_b64 = payload.get("pdf_b64")
+    page_texts = payload.get("page_texts")
+    if not page_texts:
+        assert pdf_b64, "必须提供 pdf_b64 或 page_texts"
+        pdf_bytes = base64.b64decode(pdf_b64)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        page_texts = [(p.extract_text() or "") for p in reader.pages]
+
+    checked, matched, mismatches = 0, 0, []
+    for item in payload.get("paragraphs", []):
+        checked += 1
+        q = norm(item.get("source_quote", ""))
+        pg = int(item.get("source_page", 1)) - 1
+        if pg < 0 or pg >= len(page_texts) or not q:
+            mismatches.append({**item, "reason": "invalid_page_or_empty_quote"})
+            continue
+        hay = norm(page_texts[pg])
+        if q and q in hay:
+            matched += 1
+        else:
+            mismatches.append({**item, "reason": "quote_not_found_on_page"})
+    return {"checked": checked, "matched": matched, "mismatches": mismatches}
