@@ -8,6 +8,8 @@ from datetime import datetime
 from PyPDF2 import PdfReader
 import base64, io, re
 from fastapi.responses import JSONResponse
+from fastapi import UploadFile, File, Form
+import json
 
 APP_NAME = "LitMeta"
 VERSION = "1.0"
@@ -41,6 +43,10 @@ except Exception:
 MAX_B64_BYTES = 15 * 1024 * 1024   # 15MB 上限，避免 Render/网关超限
 MAX_PARAS_PER_CALL = 100           # 单次最多校验多少段，超出请分批
 TIMEOUT_SEC = 60
+
+def _extract_page_texts_from_bytes(pdf_bytes: bytes):
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return [(p.extract_text() or "") for p in reader.pages]
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
@@ -82,6 +88,58 @@ def make_placeholder_batch():
             }
         ]
     }
+
+@app.post("/validate-quotes-upload")
+async def validate_quotes_upload(
+    pdf_file: UploadFile = File(..., description="原始 PDF 文件"),
+    paragraphs_json: str = Form(..., description="JSON 字符串，形如 [{source_quote,source_page,...}, ...]")
+):
+    """
+    直接接收上传的 PDF 文件（multipart/form-data），避免前端/模型手动转 base64。
+    """
+    try:
+        paras = json.loads(paragraphs_json)
+        if not isinstance(paras, list) or not paras:
+            return {"status": "error", "errors": ["paragraphs_required"]}
+        if len(paras) > MAX_PARAS_PER_CALL:
+            return {
+                "status": "error",
+                "errors": [f"too_many_paragraphs:{len(paras)} > {MAX_PARAS_PER_CALL}"],
+                "advice": f"请分批调用，每次不超过 {MAX_PARAS_PER_CALL} 段"
+            }
+
+        raw = await pdf_file.read()
+        if not raw:
+            return {"status": "error", "errors": ["empty_file"]}
+
+        page_texts = _extract_page_texts_from_bytes(raw)
+        if not page_texts:
+            return {"status": "error", "errors": ["empty_page_texts"]}
+
+        checked, matched, mismatches = 0, 0, []
+        for item in paras:
+            checked += 1
+            q = norm(item.get("source_quote"))
+            try:
+                pg = int(item.get("source_page", 1)) - 1
+            except Exception:
+                pg = -1
+            if pg < 0 or pg >= len(page_texts) or not q:
+                mismatches.append({**item, "reason": "invalid_page_or_empty_quote"})
+                continue
+            hay = norm(page_texts[pg])
+            if q and q in hay:
+                matched += 1
+            else:
+                mismatches.append({**item, "reason": "quote_not_found_on_page"})
+
+        return {"status": "ok", "checked": checked, "matched": matched, "mismatches": mismatches, "pages": len(page_texts)}
+
+    except json.JSONDecodeError:
+        return {"status": "error", "errors": ["paragraphs_json_invalid"]}
+    except Exception as e:
+        # 永不 500，返回结构化错误
+        return {"status": "error", "errors": [f"unexpected:{type(e).__name__}:{e}"]}
 
 # --- Actions 专用小端点：永远返回“很小”的占位 JSON ---
 @app.post("/action-analyze")
